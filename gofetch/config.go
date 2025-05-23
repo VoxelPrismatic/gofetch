@@ -2,16 +2,12 @@ package gofetch
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
-	"log"
-	"math"
-	"os/exec"
 	"reflect"
 	"regexp"
 	"strconv"
-	"strings"
 	"text/template"
-	"unicode/utf8"
 
 	"github.com/Masterminds/sprig/v3"
 )
@@ -33,6 +29,7 @@ type Module struct {
 	Key    *string
 	Val    *string
 	Format *string
+	Each   []string
 }
 
 type Section struct {
@@ -42,7 +39,10 @@ type Section struct {
 	SectionFormat *SecFormat
 }
 
-func parseMap(obj *map[string]any) {
+func parseMap(obj *map[string]any, env *map[string]any) {
+	if env == nil {
+		env = obj
+	}
 	for k, v := range *obj {
 		if r := reflect.TypeOf(v); r.Kind() == reflect.Map {
 			m := v.(map[string]any)
@@ -101,24 +101,51 @@ func parseMap(obj *map[string]any) {
 				var i uint64
 				i, err = strconv.ParseUint(x, 0, 64)
 				(*obj)[k] = uint(i)
+			case "Map":
+				q := map[string]any{}
+				x = parseTemplate(x, nil)
+				err = json.Unmarshal([]byte(x), &q)
+				(*obj)[k] = q
+			case "List":
+				q := []map[string]any{}
+				x = parseTemplate(x, *env)
+				err = json.Unmarshal([]byte(x), &q)
+				if err != nil {
+					qq := []any{}
+					old_err := err
+					err = json.Unmarshal([]byte(x), &qq)
+					if err != nil {
+						fmt.Println(x)
+						panic(old_err)
+					}
+					(*obj)[k] = qq
+				} else {
+					(*obj)[k] = q
+				}
 			default:
 				panic(fmt.Sprintf("cast not implemented: %s", m["Cast"]))
 			}
 			if err != nil {
 				panic(err)
 			}
+			if m["Debug"] != nil {
+				fmt.Printf("\x1b[1m%s:\x1b[0m\n\t%s\n\n", k, (*obj)[k])
+			}
 			continue
 		}
 		if r := reflect.TypeOf(v); r.Kind() != reflect.String {
 			continue
 		}
-		(*obj)[k] = parseTemplate(fmt.Sprint(v), nil)
+		(*obj)[k] = parseTemplate(fmt.Sprint(v), *env)
 	}
 }
 
 func (sch Schema) Parse() []string {
 	if sch.Globals != nil {
-		parseMap(sch.Globals)
+		m := map[string]any{
+			"Globals": sch.Globals,
+		}
+		parseMap(sch.Globals, &m)
 	}
 
 	ret := []string{}
@@ -159,7 +186,7 @@ func (sec Section) Parse(globals map[string]any) []string {
 			module.Format = sec.ModuleFormat
 		}
 
-		ret = append(ret, module.Parse(globals))
+		ret = append(ret, module.Parse(globals)...)
 	}
 	ret = append(ret, parseTemplate(*sec.SectionFormat.Footer, env))
 
@@ -169,67 +196,15 @@ func (sec Section) Parse(globals map[string]any) []string {
 var ansi = regexp.MustCompile("\x1b\\[(\\d+;?)+m")
 
 var tpl = template.New("base").Funcs(sprig.FuncMap()).Funcs(template.FuncMap{
-	"shell": func(cmd string) string {
-		call := exec.Command("sh", "-c", cmd)
-		stdoutPipe, _ := call.StdoutPipe()
-		if err := call.Start(); err != nil {
-			log.Fatalf("cmd.Start() failed with %s\n", err)
-		}
-
-		stdoutChan := make(chan []byte)
-
-		go func() {
-			stdout := []byte{}
-			buf := make([]byte, 1024)
-			for {
-				n, err := stdoutPipe.Read(buf)
-				if err != nil {
-					break
-				}
-				stdout = append(stdout, buf[:n]...)
-			}
-			stdoutChan <- stdout
-		}()
-
-		err := call.Wait()
-		if err != nil && err.Error() != "signal: killed" {
-			log.Fatalf("cmd.Run() failed with %s\n", err)
-		}
-		return string(<-stdoutChan)
-	},
-	"padLeft": func(str string, char rune, width int) string {
-		stripped := ansi.ReplaceAllString(str, "")
-		l := utf8.RuneCountInString(stripped)
-		return str + strings.Repeat(string(char), width-l)
-	},
-	"padRight": func(str string, char rune, width int) string {
-		stripped := ansi.ReplaceAllString(str, "")
-		l := utf8.RuneCountInString(stripped)
-		return strings.Repeat(string(char), width-l) + str
-	},
-	"padCenter": func(str string, char rune, width int) string {
-		stripped := ansi.ReplaceAllString(str, "")
-		sz := utf8.RuneCountInString(stripped)
-		w := float64(width - sz)
-		left := int(math.Floor(w / 2))
-		right := int(math.Ceil(w / 2))
-		return strings.Repeat(string(char), left) + str + strings.Repeat(string(char), right)
-	},
-	"humanSize": func(pow2 bool, sz int) string {
-		bases := []string{"B", "KiB", "MiB", "GiB", "TiB", "PiB"}
-		ratio := 1024.0
-		if !pow2 {
-			bases = []string{"B", "KB", "MB", "GB", "TB", "PB"}
-			ratio = 1000.0
-		}
-		f := float64(sz)
-		i := 0
-		for i < len(bases) && f > ratio {
-			i++
-			f /= ratio
-		}
-		return fmt.Sprintf("%.2f %s", f, bases[i])
-	},
+	"shell":     tmpl_Shell,
+	"padLeft":   tmpl_PadLeft,
+	"padRight":  tmpl_PadRight,
+	"padCenter": tmpl_PadCenter,
+	"humanSize": tmpl_HumanSize,
+	"yank":      tmpl_Yank,
+	"atMap":     tmpl_AtMap,
+	"at":        tmpl_At,
+	"key":       tmpl_Key,
 })
 
 func parseTemplate(str string, env map[string]any) string {
@@ -242,32 +217,71 @@ func parseTemplate(str string, env map[string]any) string {
 	var out bytes.Buffer
 	err = t.Execute(&out, env)
 	if err != nil {
+		fmt.Println(str)
 		panic(err)
 	}
 
 	return out.String()
 }
 
-func (mod *Module) Parse(globals map[string]any) string {
+func (mod *Module) Parse(globals map[string]any) []string {
 	env := map[string]any{
 		"Globals": globals,
 	}
-	if mod.Locals != nil {
-		parseMap(mod.Locals)
-	}
 
 	env["Locals"] = *mod.Locals
+
+	if mod.Locals != nil {
+		parseMap(mod.Locals, &env)
+	}
 
 	if mod.Val == nil {
 		*mod.Val = ""
 	}
 
-	key := parseTemplate(*mod.Key, env)
-	val := parseTemplate(*mod.Val, env)
+	ret := []string{}
+	if mod.Each != nil {
+		var loop any
+		loop = env
+		for _, k := range mod.Each {
+			loop = (loop.(map[string]any))[k]
+		}
 
-	env["Key"] = key
-	env["Val"] = val
+		try, ok := loop.([]any)
+		if !ok {
+			try2 := loop.([]map[string]any)
 
-	out := parseTemplate(*mod.Format, env)
-	return out
+			for i := range try2 {
+				env["Idx"] = i
+				key := parseTemplate(*mod.Key, env)
+				val := parseTemplate(*mod.Val, env)
+
+				env["Key"] = key
+				env["Val"] = val
+
+				ret = append(ret, parseTemplate(*mod.Format, env))
+			}
+		} else {
+			for i := range try {
+				env["Idx"] = i
+				key := parseTemplate(*mod.Key, env)
+				val := parseTemplate(*mod.Val, env)
+
+				env["Key"] = key
+				env["Val"] = val
+
+				ret = append(ret, parseTemplate(*mod.Format, env))
+			}
+		}
+
+	} else {
+		key := parseTemplate(*mod.Key, env)
+		val := parseTemplate(*mod.Val, env)
+
+		env["Key"] = key
+		env["Val"] = val
+
+		ret = append(ret, parseTemplate(*mod.Format, env))
+	}
+	return ret
 }
