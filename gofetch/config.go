@@ -50,6 +50,10 @@ func parseMap(obj *map[string]any, env *map[string]any) {
 				continue
 			}
 
+			if m["Debug"] != nil {
+				fmt.Println(env)
+			}
+
 			var err error
 			x := fmt.Sprint(m["Value"])
 			switch m["Cast"] {
@@ -103,7 +107,7 @@ func parseMap(obj *map[string]any, env *map[string]any) {
 				(*obj)[k] = uint(i)
 			case "Map":
 				q := map[string]any{}
-				x = parseTemplate(x, nil)
+				x = parseTemplate(x, *env)
 				err = json.Unmarshal([]byte(x), &q)
 				(*obj)[k] = q
 			case "List":
@@ -129,7 +133,7 @@ func parseMap(obj *map[string]any, env *map[string]any) {
 				panic(err)
 			}
 			if m["Debug"] != nil {
-				fmt.Printf("\x1b[1m%s:\x1b[0m\n\t%s\n\n", k, (*obj)[k])
+				fmt.Printf("\x1b[1m%s:\x1b[0m\n\t<==%s\n\t==>%s\n\n", k, x, (*obj)[k])
 			}
 			continue
 		}
@@ -143,7 +147,7 @@ func parseMap(obj *map[string]any, env *map[string]any) {
 func (sch Schema) Parse() []string {
 	if sch.Globals != nil {
 		m := map[string]any{
-			"Globals": sch.Globals,
+			"Globals": *sch.Globals,
 		}
 		parseMap(sch.Globals, &m)
 	}
@@ -205,6 +209,8 @@ var tpl = template.New("base").Funcs(sprig.FuncMap()).Funcs(template.FuncMap{
 	"atMap":     tmpl_AtMap,
 	"at":        tmpl_At,
 	"key":       tmpl_Key,
+	"tee":       func(q ...any) []any { fmt.Println(q...); return q },
+	"teeMap":    func(q map[string]any) map[string]any { fmt.Println(q); return q },
 })
 
 func parseTemplate(str string, env map[string]any) string {
@@ -240,6 +246,16 @@ func (mod *Module) Parse(globals map[string]any) []string {
 	}
 
 	ret := []string{}
+	run := func() {
+		key := parseTemplate(*mod.Key, env)
+		val := parseTemplate(*mod.Val, env)
+
+		env["Key"] = key
+		env["Val"] = val
+
+		ret = append(ret, parseTemplate(*mod.Format, env))
+	}
+
 	if mod.Each != nil {
 		var loop any
 		loop = env
@@ -253,35 +269,17 @@ func (mod *Module) Parse(globals map[string]any) []string {
 
 			for i := range try2 {
 				env["Idx"] = i
-				key := parseTemplate(*mod.Key, env)
-				val := parseTemplate(*mod.Val, env)
-
-				env["Key"] = key
-				env["Val"] = val
-
-				ret = append(ret, parseTemplate(*mod.Format, env))
+				run()
 			}
 		} else {
 			for i := range try {
 				env["Idx"] = i
-				key := parseTemplate(*mod.Key, env)
-				val := parseTemplate(*mod.Val, env)
-
-				env["Key"] = key
-				env["Val"] = val
-
-				ret = append(ret, parseTemplate(*mod.Format, env))
+				run()
 			}
 		}
 
 	} else {
-		key := parseTemplate(*mod.Key, env)
-		val := parseTemplate(*mod.Val, env)
-
-		env["Key"] = key
-		env["Val"] = val
-
-		ret = append(ret, parseTemplate(*mod.Format, env))
+		run()
 	}
 	return ret
 }
