@@ -3,7 +3,7 @@ package gofetch
 import (
 	"bytes"
 	"fmt"
-	"io"
+	"log"
 	"math"
 	"os/exec"
 	"reflect"
@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"text/template"
+	"unicode/utf8"
 
 	"github.com/Masterminds/sprig/v3"
 )
@@ -106,11 +107,9 @@ func parseMap(obj *map[string]any) {
 			if err != nil {
 				panic(err)
 			}
-			fmt.Printf("%s: %v\n", reflect.TypeOf((*obj)[k]).Kind().String(), (*obj)[k])
 			continue
 		}
 		if r := reflect.TypeOf(v); r.Kind() != reflect.String {
-			fmt.Printf("%s: %s\n", r.Kind().String(), v)
 			continue
 		}
 		(*obj)[k] = parseTemplate(fmt.Sprint(v), nil)
@@ -171,36 +170,65 @@ var ansi = regexp.MustCompile("\x1b\\[(\\d+;?)+m")
 
 var tpl = template.New("base").Funcs(sprig.FuncMap()).Funcs(template.FuncMap{
 	"shell": func(cmd string) string {
-		call := exec.Command("sh", cmd)
-		reader, err := call.StdoutPipe()
-		if err != nil {
-			panic(err)
+		call := exec.Command("sh", "-c", cmd)
+		stdoutPipe, _ := call.StdoutPipe()
+		if err := call.Start(); err != nil {
+			log.Fatalf("cmd.Start() failed with %s\n", err)
 		}
-		err = call.Run()
-		if err != nil {
-			panic(err)
+
+		stdoutChan := make(chan []byte)
+
+		go func() {
+			stdout := []byte{}
+			buf := make([]byte, 1024)
+			for {
+				n, err := stdoutPipe.Read(buf)
+				if err != nil {
+					break
+				}
+				stdout = append(stdout, buf[:n]...)
+			}
+			stdoutChan <- stdout
+		}()
+
+		err := call.Wait()
+		if err != nil && err.Error() != "signal: killed" {
+			log.Fatalf("cmd.Run() failed with %s\n", err)
 		}
-		stdout, err := io.ReadAll(reader)
-		if err != nil {
-			panic(err)
-		}
-		return string(stdout)
+		return string(<-stdoutChan)
 	},
 	"padLeft": func(str string, char rune, width int) string {
 		stripped := ansi.ReplaceAllString(str, "")
-		return str + strings.Repeat(string(char), width-len(stripped))
+		l := utf8.RuneCountInString(stripped)
+		return str + strings.Repeat(string(char), width-l)
 	},
 	"padRight": func(str string, char rune, width int) string {
 		stripped := ansi.ReplaceAllString(str, "")
-		return strings.Repeat(string(char), width-len(stripped)) + str
+		l := utf8.RuneCountInString(stripped)
+		return strings.Repeat(string(char), width-l) + str
 	},
 	"padCenter": func(str string, char rune, width int) string {
 		stripped := ansi.ReplaceAllString(str, "")
-		sz := len(stripped)
+		sz := utf8.RuneCountInString(stripped)
 		w := float64(width - sz)
 		left := int(math.Floor(w / 2))
 		right := int(math.Ceil(w / 2))
 		return strings.Repeat(string(char), left) + str + strings.Repeat(string(char), right)
+	},
+	"humanSize": func(pow2 bool, sz int) string {
+		bases := []string{"B", "KiB", "MiB", "GiB", "TiB", "PiB"}
+		ratio := 1024.0
+		if !pow2 {
+			bases = []string{"B", "KB", "MB", "GB", "TB", "PB"}
+			ratio = 1000.0
+		}
+		f := float64(sz)
+		i := 0
+		for i < len(bases) && f > ratio {
+			i++
+			f /= ratio
+		}
+		return fmt.Sprintf("%.2f %s", f, bases[i])
 	},
 })
 
@@ -225,12 +253,7 @@ func (mod *Module) Parse(globals map[string]any) string {
 		"Globals": globals,
 	}
 	if mod.Locals != nil {
-		for k, v := range *mod.Locals {
-			if reflect.TypeOf(v).Kind() != reflect.String {
-				continue
-			}
-			(*mod.Locals)[k] = parseTemplate(fmt.Sprint(v), nil)
-		}
+		parseMap(mod.Locals)
 	}
 
 	env["Locals"] = *mod.Locals
